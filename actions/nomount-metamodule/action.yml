@@ -1,0 +1,61 @@
+name: Fetch NoMount-Suite metamodule
+description: Download the official 00_NoMount-Module release zip (for a kernel with the engine built in) and unpack it
+inputs:
+  commit:
+    description: 'Full immutable NoMount-Suite commit SHA integrated into the kernel'
+    required: true
+outputs:
+  module_path:
+    description: 'Path to the flashable metamodule ZIP'
+    value: ${{ steps.package.outputs.module_path }}
+  module_dir:
+    description: 'Path to the extracted metamodule directory (module.prop, bin/, ...)'
+    value: ${{ steps.package.outputs.module_dir }}
+  commit:
+    description: 'NoMount-Suite source SHA integrated into the kernel'
+    value: ${{ steps.package.outputs.commit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Download NoMount-Suite release module
+      id: package
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+
+        expected_commit="${{ inputs.commit }}"
+        if ! [[ "$expected_commit" =~ ^[0-9a-f]{40}$ ]]; then
+          echo "NoMount commit must be a full 40-character SHA." >&2
+          exit 2
+        fi
+
+        repo="Bouteillepleine/NoMount-Suite"
+        dl="${RUNNER_TEMP}/nomount-suite-release"
+        module_dir="${RUNNER_TEMP}/nomount-metamodule"
+        rm -rf "$dl" "$module_dir"
+        mkdir -p "$dl" "$module_dir"
+
+        # Newest release including pre-releases (the Suite is tagged Beta).
+        tag="$(gh api "repos/${repo}/releases?per_page=1" --jq '.[0].tag_name')"
+        test -n "$tag" || { echo "No NoMount-Suite release found." >&2; exit 1; }
+        echo "NoMount-Suite release: $tag"
+
+        gh release download "$tag" --repo "$repo" --pattern '00_NoMount-Module-*.zip' --dir "$dl"
+        module_zip="$(ls "$dl"/00_NoMount-Module-*.zip | grep -v -- '-debug\.zip$' | head -1)"
+        test -s "$module_zip" || { echo "00_NoMount-Module zip not found in $tag." >&2; exit 1; }
+
+        unzip -q "$module_zip" -d "$module_dir"
+        test -f "$module_dir/module.prop" || { echo "module.prop missing from release zip." >&2; exit 1; }
+
+        # Engine commit built into the kernel vs. release tag the module came from;
+        # they can differ, so record both.
+        printf '%s\n' "$expected_commit" > "$module_dir/NOMOUNT_SOURCE_COMMIT"
+        printf '%s\n' "$tag" > "$module_dir/NOMOUNT_RELEASE_TAG"
+        sha256sum "$module_zip" > "${module_zip}.sha256"
+
+        echo "module_path=$module_zip" >> "$GITHUB_OUTPUT"
+        echo "module_dir=$module_dir" >> "$GITHUB_OUTPUT"
+        echo "commit=$expected_commit" >> "$GITHUB_OUTPUT"

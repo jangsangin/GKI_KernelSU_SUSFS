@@ -1,0 +1,90 @@
+name: 'Setup NoMount'
+description: 'Integrate the NoMount-Suite in-tree engine (hookless patch, pinned SHA or latest main) and enable CONFIG_NOMOUNT'
+
+inputs:
+  commit:
+    description: 'Full immutable NoMount-Suite commit SHA (empty = latest main branch tip)'
+    required: false
+    default: ''
+  kernel_version:
+    description: 'Kernel major/minor version (for example, 5.10 or 6.6)'
+    required: false
+    default: ''
+
+outputs:
+  commit:
+    description: 'NoMount-Suite commit SHA actually integrated'
+    value: ${{ steps.integrate.outputs.commit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Integrate NoMount-Suite engine
+      id: integrate
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel
+      env:
+        KERNEL_VERSION: ${{ inputs.kernel_version }}
+      run: |
+        set -euo pipefail
+
+        KERNEL_DIR="${{ github.workspace }}/kernel/common"
+        test -d "$KERNEL_DIR/fs" || {
+          echo "Kernel source directory does not exist: $KERNEL_DIR" >&2
+          exit 1
+        }
+
+        requested_commit="${{ inputs.commit }}"
+        SUITE_DIR="${RUNNER_TEMP}/nomount-suite-src"
+        rm -rf "$SUITE_DIR"
+        git clone --no-checkout https://github.com/Bouteillepleine/NoMount-Suite.git "$SUITE_DIR"
+
+        if [ -z "$requested_commit" ]; then
+          echo "NoMount-Suite: no commit pinned, using latest main branch tip"
+          git -C "$SUITE_DIR" checkout --detach --quiet refs/remotes/origin/main
+        else
+          if ! [[ "$requested_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "NoMount commit must be a full 40-character SHA." >&2
+            exit 2
+          fi
+          # Fetch by SHA so a commit that was rewound off main still resolves.
+          git -C "$SUITE_DIR" fetch --depth=1 origin "$requested_commit"
+          git -C "$SUITE_DIR" checkout --detach --quiet "$requested_commit"
+        fi
+        actual_commit="$(git -C "$SUITE_DIR" rev-parse HEAD)"
+        if [ -n "$requested_commit" ] && [ "$actual_commit" != "$requested_commit" ]; then
+          echo "NoMount commit mismatch: expected $requested_commit, got $actual_commit." >&2
+          exit 1
+        fi
+
+        PATCH="$SUITE_DIR/hookless/patches/nomount_kernel_integration.patch"
+        test -s "$PATCH" || { echo "Missing $PATCH" >&2; exit 1; }
+        test -s "$SUITE_DIR/hookless/src/nomount.c" || { echo "Missing hookless/src/nomount.c" >&2; exit 1; }
+        test -s "$SUITE_DIR/hookless/src/nomount.h" || { echo "Missing hookless/src/nomount.h" >&2; exit 1; }
+
+        cd "$KERNEL_DIR"
+        # --fuzz=0 on purpose: the task_mmu.c hunk has a 3-line anchor, and fuzz
+        # could let it land in a different dev/ino site (see hookless/README.md).
+        # This step must run BEFORE the SUSFS step, which also edits task_mmu.c.
+        if ! patch -p1 --fuzz=0 --dry-run < "$PATCH"; then
+          echo "::error title=NoMount-Suite::hookless patch does not apply cleanly to this kernel tree (was SUSFS applied first?)" >&2
+          exit 1
+        fi
+        patch -p1 --fuzz=0 --no-backup-if-mismatch < "$PATCH"
+        cp "$SUITE_DIR/hookless/src/nomount.c" "$SUITE_DIR/hookless/src/nomount.h" fs/
+
+        grep -q 'config NOMOUNT' fs/Kconfig || { echo "NoMount integration failed: fs/Kconfig has no NOMOUNT symbol" >&2; exit 1; }
+        grep -q 'nomount' fs/Makefile       || { echo "NoMount integration failed: fs/Makefile has no nomount object" >&2; exit 1; }
+        test -f fs/nomount.c                || { echo "NoMount integration failed: fs/nomount.c missing" >&2; exit 1; }
+
+        echo "commit=$actual_commit" >> "$GITHUB_OUTPUT"
+        echo "NOMOUNT_COMMIT=$actual_commit" >> "$GITHUB_ENV"
+        echo "NoMount-Suite integrated (kernel $KERNEL_VERSION, commit $actual_commit)"
+
+    - name: Enable NoMount in kernel defconfig
+      shell: bash
+      working-directory: ${{ github.workspace }}/kernel/common
+      run: |
+        python3 "${{ github.workspace }}/.github/scripts/append_fragment.py" \
+          "${{ github.workspace }}/.github/actions/nomount/enable-nomount-in-kernel-defconfig.fragment" \
+          --dest wild_defconfig.fragment --label enable-nomount-in-kernel-defconfig
